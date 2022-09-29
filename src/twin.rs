@@ -1,8 +1,9 @@
 use crate::{
     client::{TwinClient, TwinClientBuilder},
+    config::{load, ThingTemplate},
     reconciler::{Outcome, Reconciler},
 };
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use chrono::Utc;
 use drogue_bazaar::auth::openid::TokenConfig;
@@ -11,10 +12,14 @@ use drogue_client::{
     meta::v1::CommonMetadataMut,
     registry::{self, v1::Device},
 };
-use drogue_doppelgaenger_model::{Changed, Code, Deleting, SyntheticFeature, SyntheticType, Thing};
+use drogue_doppelgaenger_model::{Changed, Deleting, SyntheticFeature, Thing, Timer};
 use hyper::StatusCode;
+use indexmap::IndexMap;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::{
+    collections::{btree_map, BTreeMap, HashMap, HashSet},
+    path::PathBuf,
+};
 use url::Url;
 
 const FINALIZER: &str = "twin";
@@ -33,6 +38,7 @@ pub struct TwinConfig {
     pub client: ClientConfig,
     #[serde(default)]
     pub reconciler: ReconcilerConfig,
+    pub configuration: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -46,6 +52,7 @@ pub struct TwinReconciler {
     client: TwinClient,
     config: ReconcilerConfig,
     registry: registry::v1::Client,
+    template: ThingTemplate,
 }
 
 impl TwinReconciler {
@@ -53,7 +60,10 @@ impl TwinReconciler {
         let TwinConfig {
             client,
             reconciler: config,
+            configuration,
         } = config;
+        let template = load(&configuration).context("loading template configuration")?;
+        log::info!("Thing template: {template:?}");
         let client = TwinClientBuilder::from_url(client.url.clone())
             .client(client.client.clone())
             .token_provider(client.token)
@@ -64,6 +74,7 @@ impl TwinReconciler {
             config,
             client,
             registry,
+            template,
         })
     }
 }
@@ -129,6 +140,10 @@ impl TwinReconciler {
             return match self.registry.update_device(&device).await {
                 Ok(_) => Ok(Outcome::Retry),
                 Err(ClientError::Response(StatusCode::CONFLICT)) => Ok(Outcome::Retry),
+                Err(ClientError::Service {
+                    code: StatusCode::CONFLICT,
+                    ..
+                }) => Ok(Outcome::Retry),
                 Err(err) => Err(anyhow!(err).context("add finalizer")),
             };
         }
@@ -185,6 +200,10 @@ impl TwinReconciler {
                     Err(ClientError::Response(StatusCode::CONFLICT | StatusCode::NOT_FOUND)) => {
                         Ok(Outcome::Retry)
                     }
+                    Err(ClientError::Service {
+                        code: StatusCode::CONFLICT,
+                        ..
+                    }) => Ok(Outcome::Retry),
                     Err(err) => Err(anyhow!(err)),
                 }
             }
@@ -198,6 +217,10 @@ impl TwinReconciler {
                 match self.client.create_thing(thing).await {
                     Ok(_) => Ok(Outcome::Complete),
                     Err(ClientError::Response(StatusCode::CONFLICT)) => Ok(Outcome::Retry),
+                    Err(ClientError::Service {
+                        code: StatusCode::CONFLICT,
+                        ..
+                    }) => Ok(Outcome::Retry),
                     Err(err) => Err(anyhow!(err)),
                 }
             }
@@ -221,46 +244,118 @@ impl TwinReconciler {
     }
 
     fn configure_sensor(&self, thing: &mut Thing) {
-        thing.reconciliation.changed.insert(
-            "hierarchy".to_string(),
-            Changed::from(Code::JavaScript(
-                include_str!("../js/hierarchy.js").to_string(),
-            )),
-        );
-
-        thing.reconciliation.deleting.insert(
-            "hierarchy".to_string(),
-            Deleting {
-                code: Code::JavaScript(include_str!("../js/hierarchy.js").to_string()),
+        Self::sync_btreemap(
+            &self.template.synthetics,
+            &mut thing.synthetic_state,
+            |r#type| SyntheticFeature {
+                r#type: r#type.clone().into(),
+                value: Value::Null,
+                last_update: Utc::now(),
+            },
+            |r#type, current| {
+                current.r#type = r#type.clone().into();
             },
         );
 
-        syn(
-            thing,
-            "acceleration",
-            include_str!("../js/syn_acceleration.js"),
+        Self::sync_indexmap(
+            &self.template.reconciliation.deleting,
+            &mut thing.reconciliation.deleting,
+            |code| Deleting {
+                code: code.clone().into(),
+            },
+            |code, current| {
+                current.code = code.clone().into();
+            },
         );
-        syn(
-            thing,
-            "batteryLevel",
-            include_str!("../js/syn_batteryLevel.js"),
+
+        Self::sync_indexmap(
+            &self.template.reconciliation.changed,
+            &mut thing.reconciliation.changed,
+            |code| Changed {
+                code: code.clone().into(),
+                last_log: Default::default(),
+            },
+            |code, current| {
+                current.code = code.clone().into();
+            },
         );
-        syn(thing, "noise", include_str!("../js/syn_noise.js"));
-        syn(
-            thing,
-            "temperature",
-            include_str!("../js/syn_temperature.js"),
+
+        Self::sync_indexmap(
+            &self.template.reconciliation.timers,
+            &mut thing.reconciliation.timers,
+            |timer| Timer {
+                code: timer.code.clone().into(),
+                period: timer.period,
+                stopped: false,
+                last_started: None,
+                last_run: None,
+                last_log: vec![],
+                initial_delay: None,
+            },
+            |timer, current| {
+                current.code = timer.code.clone().into();
+                current.period = timer.period;
+            },
         );
     }
-}
 
-fn syn(thing: &mut Thing, name: &str, code: &str) {
-    thing.synthetic_state.insert(
-        name.to_string(),
-        SyntheticFeature {
-            r#type: SyntheticType::JavaScript(code.to_string()),
-            value: Value::Null,
-            last_update: Utc::now(),
-        },
-    );
+    fn sync_btreemap<'m, T, R, C, M>(
+        config: &IndexMap<String, T>,
+        target: &mut BTreeMap<String, R>,
+        creator: C,
+        mutator: M,
+    ) where
+        T: 'm,
+        R: 'm,
+        C: Fn(&T) -> R,
+        M: Fn(&T, &mut R),
+    {
+        let mut keys: HashSet<String> = target.keys().map(String::clone).collect();
+
+        for (name, value) in config {
+            match target.entry(name.clone()) {
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert(creator(value));
+                }
+                btree_map::Entry::Occupied(mut entry) => {
+                    mutator(value, entry.get_mut());
+                }
+            }
+
+            keys.remove(name);
+        }
+        for key in keys {
+            target.remove(&key);
+        }
+    }
+
+    fn sync_indexmap<'m, T, R, C, M>(
+        config: &IndexMap<String, T>,
+        target: &mut IndexMap<String, R>,
+        creator: C,
+        mutator: M,
+    ) where
+        T: 'm,
+        R: 'm,
+        C: Fn(&T) -> R,
+        M: Fn(&T, &mut R),
+    {
+        let mut keys: HashSet<String> = target.keys().map(String::clone).collect();
+
+        for (name, value) in config {
+            match target.entry(name.clone()) {
+                indexmap::map::Entry::Vacant(entry) => {
+                    entry.insert(creator(value));
+                }
+                indexmap::map::Entry::Occupied(mut entry) => {
+                    mutator(value, entry.get_mut());
+                }
+            }
+
+            keys.remove(name);
+        }
+        for key in keys {
+            target.remove(&key);
+        }
+    }
 }

@@ -157,6 +157,7 @@ impl TwinClient {
     }
 
     #[instrument(
+        level = "debug",
         skip_all, err,
         fields(application=application.as_ref(), name=thing.as_ref())
     )]
@@ -177,7 +178,8 @@ impl TwinClient {
     }
 
     #[instrument(
-        skip_all, ret, err,
+        level = "debug",
+        skip_all, err,
         fields(application=thing.metadata.application, name=thing.metadata.name)
     )]
     pub async fn create_thing(&self, thing: Thing) -> Result<(), ClientError> {
@@ -192,7 +194,8 @@ impl TwinClient {
     }
 
     #[instrument(
-        skip_all, ret, err,
+        level = "debug",
+        skip_all, err,
         fields(application=thing.metadata.application, name=thing.metadata.name)
     )]
     pub async fn update_thing(&self, thing: Thing) -> Result<(), ClientError> {
@@ -207,6 +210,7 @@ impl TwinClient {
     }
 
     #[instrument(
+        level = "debug",
         skip_all, ret, err,
         fields(application=application.as_ref(), name=thing.as_ref())
     )]
